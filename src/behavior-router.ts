@@ -2,27 +2,28 @@ import { Context } from 'aws-lambda';
 import bodyParser from 'body-parser';
 import connect, { HandleFunction } from 'connect';
 import cookieParser from 'cookie-parser';
-import * as chokidar from 'chokidar';
 import * as fs from 'fs-extra';
-import { createServer, Server, IncomingMessage, ServerResponse } from 'http';
+import { createServer, IncomingMessage, ServerResponse } from 'http';
+import { createServer as createServerSecure } from 'https';
+import { HttpError, InternalServerError } from './errors/http';
 import { StatusCodes } from 'http-status-codes';
 import * as os from 'os';
 import * as path from 'path';
 import { URL } from 'url';
-import { debounce } from './utils/debounce';
-import { HttpError, InternalServerError } from './errors/http';
+
 import { FunctionSet } from './function-set';
 import { asyncMiddleware, cloudfrontPost } from './middlewares';
 import { CloudFrontLifecycle, Origin, CacheService } from './services';
-import { CFDistribution, ServerlessInstance, ServerlessOptions } from './types';
+import { ServerlessInstance, ServerlessOptions } from './types';
 import {
 	buildConfig, buildContext, CloudFrontHeadersHelper, ConfigBuilder,
-	convertToCloudFrontEvent, getOriginFromCfDistribution, IncomingMessageWithBodyAndCookies
+	convertToCloudFrontEvent, IncomingMessageWithBodyAndCookies
 } from './utils';
 
+import  { CloudFrontCacheBehavior, CloudFrontOrigin } from './types/cloudformation.types';
 
 interface OriginMapping {
-	pathPattern: string;
+	Id: string;
 	target: string;
 	default?: boolean;
 }
@@ -31,19 +32,17 @@ export class BehaviorRouter {
 	private builder: ConfigBuilder;
 	private context: Context;
 	private behaviors = new Map<string, FunctionSet>();
-	private cfResources:  Record<string, CFDistribution>;
 
 	private cacheDir: string;
 	private fileDir: string;
-	private injectedHeadersFile?: string;
 	private path: string;
 
-	private started: boolean = false;
 	private origins: Map<string, Origin>;
-	private restarting: boolean = false;
-	private server: Server | null = null;
+
 	private cacheService: CacheService;
 	private log: (message: string) => void;
+
+	public buildingPromise: Promise<void>;
 
 	constructor(
 		private serverless: ServerlessInstance,
@@ -54,36 +53,19 @@ export class BehaviorRouter {
 		this.builder = buildConfig(serverless);
 		this.context = buildContext();
 
-		this.cfResources = serverless.service?.resources?.Resources || {};
-		this.cacheDir = path.resolve(options.cacheDir || path.join(os.tmpdir(), 'edge-lambda'));
-		this.fileDir = path.resolve(options.fileDir || path.join(os.tmpdir(), 'edge-lambda'));
-		this.injectedHeadersFile = options.headersFile ? path.resolve(options.headersFile) : undefined;
-		this.path = this.serverless.service.custom.offlineEdgeLambda.path || '';
+		const offlineEdgeLambda = this.serverless.service.custom.offlineEdgeLambda;
+
+		this.cacheDir = path.resolve(options.cacheDir || offlineEdgeLambda.cacheDir || path.join(os.tmpdir(), 'edge-lambda'));
+		this.fileDir = path.resolve(options.fileDir || offlineEdgeLambda.fileDir || path.join(os.tmpdir(), 'edge-lambda'));
+		this.path = offlineEdgeLambda.path || '';
 
 		fs.mkdirpSync(this.cacheDir);
 		fs.mkdirpSync(this.fileDir);
 
-		this.origins = this.configureOrigins();
+		this.origins = new Map<string, Origin>();
 		this.cacheService = new CacheService(this.cacheDir);
 
-		if (this.serverless.service.custom.offlineEdgeLambda.watchReload) {
-			this.watchFiles(path.join(this.path, '**/*'), {
-				ignoreInitial: true,
-				awaitWriteFinish: true,
-				interval: 500,
-				debounce: 750,
-				...options,
-			});
-		}
-	}
-
-	watchFiles(pattern: any, options: any) {
-		const watcher = chokidar.watch(pattern, options);
-		watcher.on('all', debounce(async (eventName, srcPath) => {
-			console.log('Lambda files changed, syncing...');
-			await this.extractBehaviors();
-			console.log('Lambda files synced');
-		}, options.debounce, true));
+		this.buildingPromise = Promise.resolve();
 	}
 
 	match(req: IncomingMessage): FunctionSet | null {
@@ -102,56 +84,12 @@ export class BehaviorRouter {
 		return this.behaviors.get('*') || null;
 	}
 
-	async start(port: number) {
-		this.started = true;
-
-		return new Promise(async (res, rej) => {
-			await this.listen(port);
-
-			// While the server is in a "restarting state" just restart the server
-			while (this.restarting) {
-				this.restarting = false;
-				await this.listen(port, false);
-			}
-
-			res('Server shutting down ...');
-		});
-	}
-
-	public hasStarted() {
-		return this.started;
-	}
-
-	public isRunning() {
-		return this.server !== null;
-	}
-
-	public async restart() {
-		if (this.restarting) {
-			return;
-		}
-
-		this.restarting = true;
-
-		this.purgeBehaviourFunctions();
-		await this.shutdown();
-	}
-
-	private async shutdown() {
-		if (this.server !== null) {
-			await this.server.close();
-		}
-		this.server = null;
-	}
-
-	private async listen(port: number, verbose: boolean = true) {
+	async listen(port: number) {
 		try {
 			await this.extractBehaviors();
+			this.logStorage();
+			this.logBehaviors();
 
-			if (verbose) {
-				this.logStorage();
-				this.logBehaviors();
-			}
 			const app = connect();
 
 			app.use(cloudfrontPost());
@@ -167,6 +105,7 @@ export class BehaviorRouter {
 				}
 
 				const handler = this.match(req);
+				const cfEvent = convertToCloudFrontEvent(req, this.builder('viewer-request'));
 
 				if (!handler) {
 					res.statusCode = StatusCodes.NOT_FOUND;
@@ -174,20 +113,9 @@ export class BehaviorRouter {
 					return;
 				}
 
-				const customOrigin = handler.distribution in this.cfResources ?
-					getOriginFromCfDistribution(handler.pattern, this.cfResources[handler.distribution]) :
-					null;
-
-				const cfEvent = convertToCloudFrontEvent(req, this.builder('viewer-request'), this.injectedHeadersFile);
-
 				try {
-					const context = {
-						...this.context,
-						functionName: handler.name,
-					};
-					const lifecycle = new CloudFrontLifecycle(this.serverless, this.options, cfEvent,
-																context, this.cacheService, handler, customOrigin);
-					const response = await lifecycle.run(req.url as string);
+					const lifecycle = new CloudFrontLifecycle(this.serverless, this.options, cfEvent, this.context, this.cacheService, handler);
+					const response = await this.buildingPromise.then(() => lifecycle.run(req.url as string));
 
 					if (!response) {
 						throw new InternalServerError('No response set after full request lifecycle');
@@ -204,11 +132,7 @@ export class BehaviorRouter {
 						}
 					}
 
-					if (response.bodyEncoding === 'base64') {
-						res.end(Buffer.from(response.body ?? '', 'base64'));
-					} else {
-						res.end(response.body);
-					}
+					res.end(response.body);
 				} catch (err) {
 					this.handleError(err, res);
 					return;
@@ -217,11 +141,18 @@ export class BehaviorRouter {
 
 
 			return new Promise(resolve => {
-				this.server = createServer(app);
-				this.server.listen(port);
-				this.server.on('close', (e: string) => {
-					resolve(e);
-				});
+				let server;
+				if (Number(port) === 443 || Number(port) === 444) {
+					server = createServerSecure({
+						key: fs.readFileSync(__dirname + '/../cert/key.pem'),
+						cert: fs.readFileSync(__dirname + '/../cert/cert.pem')
+					}, app);
+				} else {
+					server = createServer(app);
+				}
+
+				server.listen(Number(port));
+				server.on('close', resolve);
 			});
 		} catch (err) {
 			console.error(err);
@@ -229,7 +160,6 @@ export class BehaviorRouter {
 		}
 	}
 
-	// Format errors
 	public handleError(err: HttpError, res: ServerResponse) {
 		res.statusCode = err.statusCode || StatusCodes.INTERNAL_SERVER_ERROR;
 
@@ -249,56 +179,68 @@ export class BehaviorRouter {
 	}
 
 	private configureOrigins(): Map<string, Origin> {
-		const { custom } = this.serverless.service;
-		const mappings: OriginMapping[] = custom.offlineEdgeLambda.originMap || [];
+		const { custom, resources } = this.serverless.service;
+		const mappings = resources?.Resources?.CloudFrontDistribution?.Properties?.DistributionConfig?.Origins || [];
+		const originMaps: OriginMapping[] = custom.offlineEdgeLambda.originMap || [];
 
-		return mappings.reduce((acc, item) => {
-			acc.set(item.pathPattern, new Origin(item.target));
+		return mappings.reduce((acc: Map<string, Origin>, item: CloudFrontOrigin) => {
+			const baseUrl = originMaps.find(({ Id }) => Id == item.Id)?.target;
+			acc.set(item.Id, new Origin(item, baseUrl && item.OriginPath ? path.join(baseUrl, item.OriginPath) : baseUrl));
 			return acc;
 		}, new Map<string, Origin>());
 	}
 
 	private async extractBehaviors() {
-		const { functions } = this.serverless.service;
+		const { functions, resources } = this.serverless.service;
+
+		this.origins = this.configureOrigins();
 
 		const behaviors = this.behaviors;
-		const lambdaDefs = Object.entries(functions)
-			.filter(([, fn]) => 'lambdaAtEdge' in fn);
 
 		behaviors.clear();
 
-		for await (const [, def] of lambdaDefs) {
+		const eventFunctions = Object.entries(functions)
+			.filter(([, fn]) => 'events' in fn && Array.isArray(fn.events) && fn.events.length);
 
-			const pattern = def.lambdaAtEdge.pathPattern || '*';
-			const distribution = def.lambdaAtEdge.distribution || '';
-
-			if (!behaviors.has(pattern)) {
-				const origin = this.origins.get(pattern);
-				behaviors.set(pattern, new FunctionSet(pattern, distribution, this.log, origin, def.name));
+		const cloudfrontConfig = resources?.Resources?.CloudFrontDistribution?.Properties?.DistributionConfig;
+		const cloudfrontBehaviors: CloudFrontCacheBehavior[] = [];
+		
+		if (cloudfrontConfig) {
+			if (cloudfrontConfig.CacheBehaviors) {
+				cloudfrontBehaviors.push(...cloudfrontConfig.CacheBehaviors);
 			}
+			cloudfrontBehaviors.push(cloudfrontConfig.DefaultCacheBehavior);
+		}
 
-			const fnSet = behaviors.get(pattern) as FunctionSet;
+		for await (const [, fn] of eventFunctions) {
 
-			// Don't try to register distributions that come from other sources
-			if (fnSet.distribution !== distribution) {
-				this.log(`Warning: pattern ${pattern} has registered handlers for cf distributions ${fnSet.distribution}` +
-						` and ${distribution}. There is no way to tell which distribution should be used so only ${fnSet.distribution}` +
-						` has been registered.` );
-				continue;
+			const cloudfrontEvents = fn.events.filter(evt => 'cloudFront' in evt);
+
+			for await (const event of cloudfrontEvents) {
+			
+				const lambdaAtEdge = event.cloudFront;
+
+				const pattern = lambdaAtEdge.pathPattern || '*';
+
+				if (!behaviors.has(pattern)) {
+					const origin = this.origins.get(lambdaAtEdge.origin.Id);
+					const behavior = cloudfrontBehaviors.find(b => b.TargetOriginId === lambdaAtEdge.origin.Id);
+					behaviors.set(pattern, new FunctionSet(pattern, this.log, origin, lambdaAtEdge.origin.Id, behavior));
+				}
+
+				const fnSet = behaviors.get(pattern) as FunctionSet;
+
+				await fnSet.setHandler(lambdaAtEdge.eventType, path.join(this.path, fn.handler));
 			}
-
-			await fnSet.setHandler(def.lambdaAtEdge.eventType, path.join(this.path, def.handler));
 		}
 
 		if (!behaviors.has('*')) {
-			behaviors.set('*', new FunctionSet('*', '', this.log, this.origins.get('*')));
+			behaviors.set('*', new FunctionSet('*', this.log, this.origins.get('*')));
 		}
 	}
 
-	private purgeBehaviourFunctions() {
-		this.behaviors.forEach((behavior) => {
-			behavior.purgeLoadedFunctions();
-		});
+	public async reloadBehaviors() {
+		await this.extractBehaviors();
 	}
 
 	private logStorage() {
@@ -309,10 +251,7 @@ export class BehaviorRouter {
 
 	private logBehaviors() {
 		this.behaviors.forEach((behavior, key) => {
-
-			this.log(`Lambdas for path pattern ${key}` +
-				(behavior.distribution === '' ? ':' : ` on ${behavior.distribution}:`)
-			);
+			this.log(`Lambdas for path pattern ${key}: `);
 
 			behavior.viewerRequest && this.log(`viewer-request => ${behavior.viewerRequest.path || ''}`);
 			behavior.originRequest && this.log(`origin-request => ${behavior.originRequest.path || ''}`);

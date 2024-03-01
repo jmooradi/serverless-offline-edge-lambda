@@ -2,7 +2,7 @@ import {
 	CloudFrontRequestEvent, CloudFrontRequestResult, CloudFrontResponseEvent, CloudFrontResponseResult, Context
 } from 'aws-lambda';
 import globToRegExp from 'glob-to-regexp';
-
+import { CloudFrontCacheBehavior } from './types/cloudformation.types';
 import { Origin } from './services';
 import { EventType } from './types';
 import { CallbackPromise, ModuleLoader} from './utils';
@@ -14,6 +14,14 @@ export type AsyncCloudFrontResponseHandler = (event: CloudFrontResponseEvent, co
 const identityRequestHandler = async (event: CloudFrontRequestEvent) => event.Records[0].cf.request;
 const identityResponseHandler = async (event: CloudFrontResponseEvent) => event.Records[0].cf.response;
 
+export interface Behavior {
+	maxTTL: number;
+	minTTL: number;
+	defaultTTL: number;
+	allowedMethods: string[];
+	cachedMethods: string[];
+}
+
 export class FunctionSet {
 	protected readonly moduleLoader: ModuleLoader = new ModuleLoader();
 
@@ -24,14 +32,29 @@ export class FunctionSet {
 	originResponse: Annotated<AsyncCloudFrontResponseHandler> = identityResponseHandler;
 	viewerResponse: Annotated<AsyncCloudFrontResponseHandler> = identityResponseHandler;
 
+	public readonly behavior: Behavior = {
+		minTTL: 0,
+		maxTTL: 31536000,
+		defaultTTL: 86400,
+		allowedMethods: ['GET', 'HEAD'],
+		cachedMethods: ['GET', 'HEAD'],
+	};
+
 	constructor(
 		public readonly pattern: string,
-		public readonly distribution: string,
 		private readonly log: (message: string) => void,
 		public readonly origin: Origin = new Origin(),
-		public readonly name: string = ''
+		public readonly name: string = '',
+		behavior?: CloudFrontCacheBehavior
 	) {
 		this.regex = globToRegExp(pattern);
+		if (behavior) {
+			this.behavior.minTTL 			= behavior.MinTTL 			|| this.behavior.minTTL;
+			this.behavior.maxTTL 			= behavior.MaxTTL 			|| this.behavior.maxTTL;
+			this.behavior.defaultTTL 		= behavior.DefaultTTL 		|| this.behavior.defaultTTL;
+			this.behavior.allowedMethods	= behavior.AllowedMethods 	|| this.behavior.allowedMethods;
+			this.behavior.cachedMethods 	= behavior.CachedMethods 	|| this.behavior.cachedMethods;
+		}
 	}
 
 	async setHandler(event: EventType, path: string) {

@@ -9,6 +9,7 @@ class OfflineEdgeLambdaPlugin {
 	private hooks: { [key: string]: Function };
 
 	private server: BehaviorRouter;
+	private buildingCb: (value?: any) => void = () => {};
 	private log: (message: string) => void;
 
 	constructor(
@@ -71,7 +72,8 @@ class OfflineEdgeLambdaPlugin {
 		this.hooks = {
 			'offline:start:init': this.onStart.bind(this),
 			'offline:start:end': this.onEnd.bind(this),
-			'webpack:compile:watch:compile': this.onReload.bind(this)
+			'before:webpack:compile:watch:compile': this.buildStart.bind(this),
+			'after:webpack:compile:watch:compile': this.buildFinish.bind(this)
 		};
 	}
 
@@ -80,26 +82,27 @@ class OfflineEdgeLambdaPlugin {
 			const port = this.options.cloudfrontPort || this.options.port || 8080;
 
 			this.log(`CloudFront Offline listening on port ${port}`);
-			await this.server.start(port);
+			await this.server.listen(port);
+			this.server.buildingPromise = Promise.resolve();
 		} catch (err) {
 			console.error(err);
 		}
 	}
 
+	async buildStart() {
+		this.server.buildingPromise = new Promise((resolve, _) => {
+			this.buildingCb = resolve;
+		});
+	}
+
+	async buildFinish() {
+		this.buildingCb();
+		await this.server.reloadBehaviors();
+	}
+
 	async onEnd() {
 		await this.server.purgeStorage();
 		this.log(`CloudFront Offline storage purged`);
-	}
-
-	async onReload() {
-		// In the event we have not started the server yet or we are in the process of
-		// restarting the server ignore our changes
-		if (!this.server.hasStarted() || !this.server.isRunning()) {
-			return;
-		}
-
-		console.log('Restarting server due to function update...');
-		await this.server.restart();
 	}
 
 	private prepareCustomSection() {

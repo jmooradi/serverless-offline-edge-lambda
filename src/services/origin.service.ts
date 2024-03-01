@@ -1,20 +1,22 @@
-import { CloudFrontRequest, CloudFrontRequestEvent, CloudFrontResultResponse } from 'aws-lambda';
+import { CloudFrontRequest, CloudFrontRequestEvent, CloudFrontResultResponse, CloudFrontHeaders } from 'aws-lambda';
+import { InternalServerError, NotFoundError } from '../errors/http';
 import * as fs from 'fs-extra';
 import * as http from 'http';
 import * as https from 'https';
 import * as path from 'path';
-import { parse } from 'url';
 
+import { parse } from 'url';
 import { toHttpHeaders } from '../utils';
 import { OutgoingHttpHeaders } from 'http';
-import { InternalServerError, NotFoundError } from '../errors/http';
-import { StatusCodes } from 'http-status-codes';
+import { OriginCustomHeader, CloudFrontOrigin } from '../types/cloudformation.types';
 
 
 export class Origin {
 	private readonly type: 'http' | 'https' | 'file' | 'noop' = 'http';
+	private readonly origin: CloudFrontRequest['origin'];
+	constructor(origin?: CloudFrontOrigin, public readonly baseUrl: string = "") {
+		let originPath = origin?.OriginPath || '/';
 
-	constructor(public readonly baseUrl: string = '') {
 		if (!baseUrl) {
 			this.type = 'noop';
 		} else if (/^http:\/\//.test(baseUrl)) {
@@ -24,7 +26,38 @@ export class Origin {
 		} else {
 			this.baseUrl = path.resolve(baseUrl);
 			this.type = 'file';
+			originPath = baseUrl;
 		}
+
+		const customHeaders: CloudFrontHeaders = {};
+
+		this.origin = {
+			custom: {
+				customHeaders: origin?.OriginCustomHeaders?.reduce((acc, header) => {
+					acc[header.HeaderName.toLowerCase()] = [{key: header.HeaderName, value: header.HeaderValue}];
+					return acc;
+				}, customHeaders) || {},
+				domainName: origin?.DomainName || 'example.com',
+				path: originPath,
+				keepaliveTimeout: 5,
+				port: 443,
+				protocol: 'https',
+				readTimeout: 5,
+				sslProtocols: ['TLSv1', 'TLSv1.1']
+			},
+			// @ts-expect-error
+			s3: {
+				customHeaders: origin?.OriginCustomHeaders?.reduce((acc, header) => {
+					acc[header.HeaderName.toLowerCase()] = [{key: header.HeaderName, value: header.HeaderValue}];
+					return acc;
+				}, customHeaders) || {},
+				domainName: origin?.DomainName || 'example.com',
+				path: originPath,
+			}
+		}
+	}
+	init(event: CloudFrontRequestEvent) {
+		event.Records[0].cf.request.origin = this.origin;
 	}
 
 	async retrieve(event: CloudFrontRequestEvent): Promise<CloudFrontResultResponse> {
@@ -35,7 +68,7 @@ export class Origin {
 
 			return {
 				status: '200',
-				statusDescription: 'OK',
+				statusDescription: '',
 				headers: {
 					'content-type': [
 						{ key: 'content-type', value: 'application/json' }
@@ -45,13 +78,10 @@ export class Origin {
 				body: contents
 			};
 		} catch (err) {
-			// Make sure error gets back to user
-			const status = err.statusCode || StatusCodes.INTERNAL_SERVER_ERROR;
-			const reasonPhrase = err.reasonPhrase || 'Internal Server Error';
-
+			let status = err.isBoom ? err.output.statusCode : 500
 			return {
 				status: status,
-				statusDescription: reasonPhrase,
+				statusDescription: err.message,
 				headers: {
 					'content-type': [
 						{ key: 'content-type', value: 'application/json' }
@@ -59,10 +89,10 @@ export class Origin {
 				},
 				bodyEncoding: 'text',
 				body: JSON.stringify({
-					'code': status,
-					'message': err.message
+					"code": status,
+					"message": err.message
 				})
-			};
+			}
 		}
 	}
 
@@ -75,7 +105,7 @@ export class Origin {
 			}
 			case 'http':
 			case 'https': {
-				return await this.getHttpResource(request);
+				return this.getHttpResource(request);
 			}
 			case 'noop': {
 				throw new NotFoundError('Operation given as \'noop\'');
@@ -89,14 +119,13 @@ export class Origin {
 	private async getFileResource(key: string): Promise<string> {
 		const uri = parse(key);
 		const fileName = uri.pathname;
-
-		const fileTarget = `${this.baseUrl}/${fileName}`;
+		const fileTarget = path.join(this.baseUrl, fileName || "");
 
 		// Check for if path given is accessible and is a file before fetching it
 		try {
 			await fs.access(fileTarget);
 		} catch {
-			throw new NotFoundError(`File ${fileTarget} does not exist`);
+			throw new NotFoundError(`${fileTarget} does not exist.`);
 		}
 
 		const fileState = await fs.lstat(fileTarget);
@@ -104,7 +133,7 @@ export class Origin {
 			throw new NotFoundError(`${fileTarget} is not a file.`);
 		}
 
-		return await fs.readFile(`${this.baseUrl}/${fileName}`, 'utf-8');
+		return await fs.readFile(fileTarget, 'utf-8');
 	}
 
 	private async getHttpResource(request: CloudFrontRequest): Promise<string> {
@@ -122,7 +151,7 @@ export class Origin {
 			method: request.method,
 			protocol: baseUrl.protocol,
 			hostname: baseUrl.hostname,
-			port: baseUrl.port || (baseUrl.protocol === 'https:' ? 443 : 80),
+			port: baseUrl.port || (baseUrl.protocol === 'https:') ? 443 : 80,
 			path: uri.path,
 			headers: {
 				...headers,
@@ -143,10 +172,6 @@ export class Origin {
 				});
 				res.on('error', (err: Error) => reject(err));
 			});
-
-			if (request.body && request.body.data) {
-				req.write(request.body.data);
-			}
 
 			req.end();
 		});

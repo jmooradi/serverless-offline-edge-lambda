@@ -1,13 +1,13 @@
 import {
-	CloudFrontRequestEvent, CloudFrontResponseResult, CloudFrontOrigin, Context
+	CloudFrontRequestEvent, CloudFrontResponseResult, CloudFrontResultResponse, Context
 } from 'aws-lambda';
 
+import { MethodNotAllowedError } from '../errors/http';
 import { NoResult } from '../errors';
 import { FunctionSet } from '../function-set';
 import { combineResult, isResponseResult, toResultResponse } from '../utils';
 import { CacheService } from './cache.service';
 import { ServerlessInstance, ServerlessOptions } from '../types';
-
 
 export class CloudFrontLifecycle {
 
@@ -19,14 +19,24 @@ export class CloudFrontLifecycle {
 		private event: CloudFrontRequestEvent,
 		private context: Context,
 		private fileService: CacheService,
-		private fnSet: FunctionSet,
-		private origin: CloudFrontOrigin | null,
+		private fnSet: FunctionSet
 	) {
 		this.log = serverless.cli.log.bind(serverless.cli);
 	}
 
 	async run(url: string): Promise<CloudFrontResponseResult | void> {
-		this.log(`Request for ${url}`);
+
+		this.fnSet.origin.init(this.event);
+		
+		const method = this.event.Records[0].cf.request.method;
+
+		this.log(`${method} ${url}`);
+
+		if (!this.fnSet.behavior.allowedMethods.includes(method))
+		{
+			this.log('✗  Method Not Allowed');
+			throw new MethodNotAllowedError("Cloudfront method not allowed");
+		}
 
 		try {
 			return await this.onViewerRequest();
@@ -44,16 +54,25 @@ export class CloudFrontLifecycle {
 			}
 		}
 
-		const result = await this.onOriginRequest();
+		let result = await this.onOriginRequest();
 
-		await this.fileService.saveToCache(combineResult(this.event, result));
+		if (this.canCache()) {
+			await this.fileService.saveToCache(combineResult(this.event, result), this.fnSet.behavior);
+		}
 
-		return await this.onViewerResponse(result);
+		result = await this.onViewerResponse(result);
+		if (result) {
+			(result.headers || (result.headers = {}))['x-cache'] = [{key: 'X-Cache', value: 'Miss'}];
+		}
+
+		return result;
 	}
 
 	async onViewerRequest() {
 		this.log('→ viewer-request');
 
+		//@ts-expect-error
+		this.event.Records[0].cf.config.eventType = 'viewer-request';
 		const result = await this.fnSet.viewerRequest(this.event, this.context);
 
 		if (isResponseResult(result)) {
@@ -66,14 +85,24 @@ export class CloudFrontLifecycle {
 	async onViewerResponse(result: CloudFrontResponseResult) {
 		this.log('← viewer-response');
 
+		//@ts-expect-error
+		this.event.Records[0].cf.config.eventType = 'viewer-response';
 		const event = combineResult(this.event, result);
 		return this.fnSet.viewerResponse(event, this.context);
+	}
+
+	private canCache() {
+		if (this.options.disableCache) {
+			return false;
+		}
+		const method = this.event.Records[0].cf.request.method;
+		return this.fnSet.behavior.cachedMethods.includes(method);
 	}
 
 	async onCache() {
 		this.log('→ cache');
 
-		if (this.options.disableCache) {
+		if (!this.canCache()) {
 			this.log('✗ Cache disabled');
 			throw new NoResult();
 		}
@@ -82,14 +111,13 @@ export class CloudFrontLifecycle {
 
 		if (!cached) {
 			this.log('✗ Cache miss');
-
 			throw new NoResult();
 		} else {
 			this.log('✓ Cache hit');
-			throw new NoResult();
 		}
 
 		const result = toResultResponse(cached);
+		(result.headers || (result.headers = {}))['X-Cache'] = [{key: 'X-Cache', value: 'Hit'}];
 		return this.onViewerResponse(result);
 	}
 
@@ -101,10 +129,8 @@ export class CloudFrontLifecycle {
 	async onOriginRequest() {
 		this.log('→ origin-request');
 
-		// Inject origin into request once we reach the origin request step
-		// as it is not available in viewer requests
-		this.injectOriginIntoRequest();
-
+		//@ts-expect-error
+		this.event.Records[0].cf.config.eventType = 'origin-request';
 		const result = await this.fnSet.originRequest(this.event, this.context);
 
 		if (isResponseResult(result)) {
@@ -119,13 +145,9 @@ export class CloudFrontLifecycle {
 	async onOriginResponse(result: CloudFrontResponseResult) {
 		this.log('← origin-response');
 
+		//@ts-expect-error
+		this.event.Records[0].cf.config.eventType = 'origin-response';
 		const event = combineResult(this.event, result);
 		return this.fnSet.originResponse(event, this.context);
-	}
-
-	protected injectOriginIntoRequest() {
-		if (this?.event?.Records[0]?.cf?.request && this.origin !== null) {
-			this.event.Records[0].cf.request.origin = this.origin;
-		}
 	}
 }

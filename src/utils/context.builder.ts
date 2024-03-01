@@ -1,4 +1,5 @@
 import { Context } from 'aws-lambda';
+import { v1 as uuid } from 'uuid';
 
 export function buildContext(): Context {
 	return {
@@ -7,7 +8,7 @@ export function buildContext(): Context {
 		functionVersion: '',
 		invokedFunctionArn: '',
 		memoryLimitInMB: '128',
-		awsRequestId: '',
+		awsRequestId: uuid(),
 		logGroupName: '',
 		logStreamName: '',
 

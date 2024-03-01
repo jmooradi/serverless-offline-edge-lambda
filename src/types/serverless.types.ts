@@ -1,3 +1,4 @@
+import { CloudFrontDistribution, CloudFrontOrigin } from './cloudformation.types';
 
 export interface ServerlessInstance {
 	cli: {
@@ -13,8 +14,13 @@ export interface ServerlessInstance {
 		}
 		functions: { [key: string]: ServerlessFunction }
 		package: ServerlessPackage
-		resources?: {
-			Resources?: Record<string, CFDistribution>
+		resources: {
+			Resources: {
+				CloudFrontDistribution: {
+					Type: string;
+					Properties: CloudFrontDistribution;
+				}
+			}
 		}
 		getAllFunctions: () => string[]
 	};
@@ -83,13 +89,19 @@ export interface EdgeLambdaOptions {
 	distribution: string;
 	eventType: | 'origin-request' | 'origin-response' | 'viewer-request' | 'viewer-response';
 	pathPattern: string;
+	origin: CloudFrontOrigin;
+}
+
+export interface ServerlessEvent {
+	cloudFront: EdgeLambdaOptions;
 }
 
 export interface ServerlessFunction {
 	name: string;
 	handler: string;
 	package: ServerlessPackage;
-	lambdaAtEdge: EdgeLambdaOptions;
+	//lambdaAtEdge: EdgeLambdaOptions;
+	events: ServerlessEvent[];
 }
 
 export interface ServerlessPackage {

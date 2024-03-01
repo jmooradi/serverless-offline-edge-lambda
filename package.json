@@ -48,9 +48,10 @@
     "cookie-parser": "^1.4.6",
     "flat-cache": "^3.0.4",
     "fs-extra": "^11.1.1",
-    "fsevents": "^2.3.2",
     "glob-to-regexp": "^0.4.1",
-    "http-status-codes": "^2.2.0"
+    "http-status-codes": "^2.2.0",
+    "parse-cache-control": "^1.0.1",
+    "uuid": "^9.0.1"
   },
   "peerDependencies": {
     "serverless": ">=1.36.0"
@@ -72,6 +73,9 @@
     "@types/cookie-parser": "^1.4.3",
     "@types/fs-extra": "^11.0.1",
     "@types/glob-to-regexp": "^0.4.0",
+    "@types/parse-cache-control": "^1.0.4",
+    "@types/serverless": "^3.12.22",
+    "@types/uuid": "^9.0.8",
     "commitizen": "^4.2.5",
     "cz-conventional-changelog": "^3.3.0",
     "husky": "^8.0.0",
